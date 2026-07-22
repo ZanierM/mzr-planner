@@ -1,0 +1,669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<title>MZR Planner</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;font-size:16px}
+input,select,textarea,button{font-family:inherit;font-size:16px}
+::-webkit-scrollbar{width:5px;height:5px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:#94a3b855;border-radius:3px}
+</style>
+</head>
+<body><div id="root"></div>
+<script type="text/babel">
+const {useState,useEffect,useRef}=React;
+
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2)}
+function load(k,fb){try{const v=localStorage.getItem(k);return v?JSON.parse(v):fb}catch{return fb}}
+function save(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch{}}
+async function hashPw(pw){const b=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(pw));return Array.from(new Uint8Array(b)).map(x=>x.toString(16).padStart(2,'0')).join('')}
+
+// School weeks: start Mon 31 Aug 2026, alternating TT week 1/2
+function getWeeks(){
+  const weeks=[];
+  let d=new Date(2026,7,31);
+  while(d.getDay()!==1)d.setDate(d.getDate()+1);
+  const end=new Date(2027,6,25);
+  let n=1;
+  while(d<=end){
+    const mon=new Date(d),fri=new Date(d);fri.setDate(fri.getDate()+4);
+    const fmt=dt=>dt.toLocaleDateString('en-GB',{day:'numeric',month:'short'});
+    const ttW=n%2===1?1:2;
+    weeks.push({id:n,label:`Week ${n}: ${fmt(mon)}–${fmt(fri)} · TT${ttW}`,monday:new Date(mon),ttW});
+    d.setDate(d.getDate()+7);n++;
+  }
+  return weeks;
+}
+const WEEKS=getWeeks();
+const DAYS=['Monday','Tuesday','Wednesday','Thursday','Friday'];
+const DS=['Mon','Tue','Wed','Thu','Fri'];
+const PER=['P1','P2','P3','P4','P5'];
+const CATS={teaching:'📚',pastoral:'🧑‍🤝‍🧑',admin:'📋',marking:'✏️',meeting:'🗓',personal:'⭐'};
+const PRI={high:{l:'High',c:'#ef4444',bg:'#fef2f2',bgd:'#3f1212'},medium:{l:'Med',c:'#f59e0b',bg:'#fffbeb',bgd:'#3b2700'},low:{l:'Low',c:'#22c55e',bg:'#f0fdf4',bgd:'#052e16'}};
+const RAG={red:{l:'Red',c:'#ef4444',bg:'#fef2f2',bgd:'#3f1212'},amber:{l:'Amber',c:'#f59e0b',bg:'#fffbeb',bgd:'#3b2700'},green:{l:'Green',c:'#22c55e',bg:'#f0fdf4',bgd:'#052e16'}};
+const CM=['Call','Email','Teams','Letter','In person','Text'];
+
+function getTodayInfo(){
+  const t=new Date();t.setHours(0,0,0,0);
+  for(const w of WEEKS){const m=new Date(w.monday);m.setHours(0,0,0,0);const f=new Date(m);f.setDate(f.getDate()+4);if(t>=m&&t<=f)return{weekId:w.id,dayIdx:Math.min(Math.max(t.getDay()-1,0),4)}}
+  return{weekId:1,dayIdx:0};
+}
+function dayFmt(monday,i){const d=new Date(monday);d.setDate(d.getDate()+i);return d.toLocaleDateString('en-GB',{day:'numeric',month:'short'})}
+
+async function gistLoad(tok,gid){
+  const r=await fetch(`https://api.github.com/gists/${gid}`,{headers:{Authorization:`token ${tok}`,'Accept':'application/vnd.github.v3+json'}});
+  if(!r.ok){const t=await r.text();throw new Error(`${r.status}: ${t.slice(0,100)}`)}
+  const d=await r.json();const c=d.files['mzr-planner-data.json']?.content;return c?JSON.parse(c):null;
+}
+async function gistSave(tok,gid,payload){
+  const r=await fetch(`https://api.github.com/gists/${gid}`,{method:'PATCH',headers:{Authorization:`token ${tok}`,'Content-Type':'application/json'},body:JSON.stringify({files:{'mzr-planner-data.json':{content:JSON.stringify(payload,null,2)}}})});
+  if(!r.ok){const t=await r.text();throw new Error(`${r.status}: ${t.slice(0,100)}`)}
+}
+async function gistCreate(tok){
+  const r=await fetch('https://api.github.com/gists',{method:'POST',headers:{Authorization:`token ${tok}`,'Content-Type':'application/json'},body:JSON.stringify({description:'MZR Planner Data',public:false,files:{'mzr-planner-data.json':{content:'{}'}}})});
+  if(!r.ok)throw new Error('Failed to create Gist');
+  return(await r.json()).id;
+}
+
+// ── Password Screen ──────────────────────────────────────────────────────────
+function PasswordScreen({onUnlock,dark}){
+  const C=dark?{bg:'#0d1117',sur:'#161b22',bor:'#30363d',txt:'#e6edf3',mut:'#8b949e',acc:'#818cf8'}:{bg:'#f0f2f5',sur:'#ffffff',bor:'#e2e8f0',txt:'#0f172a',mut:'#64748b',acc:'#4f46e5'};
+  const [mode,setMode]=useState(()=>load('mzr_pwhash',null)?'login':'setup');
+  const [pw,setPw]=useState('');const [pw2,setPw2]=useState('');const [err,setErr]=useState('');const [busy,setBusy]=useState(false);
+  const si={width:'100%',background:C.bg,border:`1px solid ${err?'#ef4444':C.bor}`,color:C.txt,borderRadius:8,padding:'10px 12px',outline:'none',boxSizing:'border-box',marginBottom:10};
+  async function setup(){if(pw.length<4){setErr('Min 4 characters');return}if(pw!==pw2){setErr('Passwords do not match');return}setBusy(true);save('mzr_pwhash',await hashPw(pw));setBusy(false);onUnlock()}
+  async function login(){setBusy(true);const h=await hashPw(pw);if(h===load('mzr_pwhash',null)){onUnlock()}else{setErr('Incorrect password');setPw('')}setBusy(false)}
+  return(<div style={{minHeight:'100vh',background:C.bg,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+    <div style={{background:C.sur,border:`1px solid ${C.bor}`,borderRadius:16,padding:36,width:'100%',maxWidth:380,boxShadow:'0 8px 32px rgba(0,0,0,0.12)'}}>
+      <div style={{textAlign:'center',marginBottom:28}}><div style={{fontSize:36,marginBottom:8}}>🎓</div><div style={{fontSize:20,fontWeight:800,color:C.acc}}>MZR Planner</div><div style={{fontSize:12,color:C.mut,marginTop:4}}>{mode==='setup'?'Create your password':'Enter your password'}</div></div>
+      <input type="password" placeholder="Password" value={pw} onChange={e=>{setPw(e.target.value);setErr('')}} onKeyDown={e=>e.key==='Enter'&&(mode==='setup'?pw2?setup():document.getElementById('pw2')?.focus():login())} style={si} autoFocus/>
+      {mode==='setup'&&<input id="pw2" type="password" placeholder="Confirm password" value={pw2} onChange={e=>{setPw2(e.target.value);setErr('')}} onKeyDown={e=>e.key==='Enter'&&setup()} style={si}/>}
+      {err&&<div style={{color:'#ef4444',fontSize:12,marginBottom:10}}>{err}</div>}
+      <button onClick={mode==='setup'?setup:login} disabled={busy} style={{width:'100%',background:C.acc,color:'#fff',border:'none',borderRadius:8,padding:'11px',fontWeight:700,fontSize:14,cursor:'pointer'}}>{busy?'…':mode==='setup'?'Set password & open':'Unlock'}</button>
+      {mode==='login'&&<button onClick={()=>{if(confirm('Clear password?')){localStorage.removeItem('mzr_pwhash');setMode('setup');setPw('');setErr('')}}} style={{width:'100%',background:'none',border:'none',color:C.mut,fontSize:11,cursor:'pointer',marginTop:12,padding:4}}>Forgot password / reset</button>}
+    </div></div>);
+}
+
+// ── Gist Setup Screen ────────────────────────────────────────────────────────
+function GistSetup({onDone,onSkip,dark}){
+  const C=dark?{bg:'#0d1117',sur:'#161b22',bor:'#30363d',txt:'#e6edf3',mut:'#8b949e',acc:'#818cf8',abg:'#1e2044'}:{bg:'#f0f2f5',sur:'#ffffff',bor:'#e2e8f0',txt:'#0f172a',mut:'#64748b',acc:'#4f46e5',abg:'#eef2ff'};
+  const [tok,setTok]=useState('');const [st,setSt]=useState('');const [busy,setBusy]=useState(false);
+  const si={width:'100%',background:C.bg,border:`1px solid ${C.bor}`,color:C.txt,borderRadius:8,padding:'9px 12px',outline:'none',boxSizing:'border-box',marginBottom:10};
+  async function connect(){if(!tok.trim()){setSt('❌ Enter a token');return}setBusy(true);setSt('Connecting…');
+    try{
+      const lr=await fetch('https://api.github.com/gists',{headers:{Authorization:`token ${tok.trim()}`,'Accept':'application/vnd.github.v3+json'}});
+      if(!lr.ok)throw new Error(`Token error: ${lr.status}`);
+      const gists=await lr.json();
+      const ex=gists.find(g=>g.description==='MZR Planner Data'&&g.files['mzr-planner-data.json']);
+      let gid=ex?ex.id:await gistCreate(tok.trim());
+      setSt(ex?'✅ Found existing Gist!':'✅ New Gist created!');
+      save('mzr_gist_token',tok.trim());save('mzr_gist_id',gid);
+      setTimeout(()=>onDone(tok.trim(),gid),700);
+    }catch(e){setSt('❌ '+e.message)}
+    setBusy(false);
+  }
+  return(<div style={{minHeight:'100vh',background:C.bg,display:'flex',alignItems:'center',justifyContent:'center',padding:20}}>
+    <div style={{background:C.sur,border:`1px solid ${C.bor}`,borderRadius:16,padding:32,width:'100%',maxWidth:480}}>
+      <div style={{fontSize:18,fontWeight:800,color:C.acc,marginBottom:4}}>☁️ Enable sync</div>
+      <div style={{fontSize:12,color:C.mut,marginBottom:16,lineHeight:1.7}}>Paste your GitHub token. The planner finds your existing Gist automatically, or creates a new one.</div>
+      <div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:10,padding:12,marginBottom:14,fontSize:12,lineHeight:1.8,color:C.txt}}>
+        <b>Get a token:</b> github.com → Settings → Developer settings → Personal access tokens → <b>Tokens (classic)</b> → Generate → tick <b>gist</b> only
+      </div>
+      <input type="password" placeholder="Paste GitHub token" value={tok} onChange={e=>setTok(e.target.value)} onKeyDown={e=>e.key==='Enter'&&connect()} style={si}/>
+      {st&&<div style={{fontSize:12,fontWeight:600,color:st.startsWith('✅')?'#22c55e':st.startsWith('❌')?'#ef4444':C.mut,marginBottom:10}}>{st}</div>}
+      <button onClick={connect} disabled={busy} style={{width:'100%',background:C.acc,color:'#fff',border:'none',borderRadius:8,padding:'10px',fontWeight:700,cursor:'pointer',marginBottom:8}}>{busy?'Connecting…':'Connect & enable sync'}</button>
+      <button onClick={onSkip} style={{width:'100%',background:'none',border:`1px solid ${C.bor}`,color:C.mut,borderRadius:8,padding:'9px',cursor:'pointer',fontSize:12}}>Skip — use local storage only</button>
+    </div></div>);
+}
+
+// ── Main Planner ─────────────────────────────────────────────────────────────
+function Planner(){
+  const today=getTodayInfo();
+  const [dark,setDark]=useState(()=>load('tp_dark',false));
+  const [selWeek,setSelWeek]=useState(()=>load('tp_week',today.weekId));
+  const [focusMode,setFocusMode]=useState(false);
+  const [vis,setVis]=useState(()=>{const s=load('tp_vis',null),all=['timetable','tasks','stats','hoy','homework','cover','keydates','notes','reflect'];if(!s)return all.filter(x=>x!=='reflect');return[...new Set([...s.filter(x=>all.includes(x)),...all.filter(x=>!s.includes(x)&&x!=='reflect')])];});
+  // rightCol: panels shown in right column alongside timetable. Others go full-width below.
+  const [rightCol,setRightCol]=useState(()=>load('tp_rightcol',['tasks','stats','notes']));
+  const [showManage,setShowManage]=useState(false);
+  const dragPanel=useRef(null);
+  const dragTarget=useRef(null);
+
+  // Global data
+  const [todos,setTodos]=useState(()=>{const v=load('tp_todos',[]);return Array.isArray(v)?v:[]});
+  const [hw,setHw]=useState(()=>{const v=load('tp_hw',[]);return Array.isArray(v)?v:[]});
+  const [tt1,setTT1]=useState(()=>load('tp_tt1',{})); // preset Week 1
+  const [tt2,setTT2]=useState(()=>load('tp_tt2',{})); // preset Week 2
+  const [ttVer,setTTVer]=useState(()=>load('tp_tt_ver',{})); // per-school-week override
+  const [keyDates,setKeyDates]=useState(()=>{
+    const saved=load('tp_kd',null);
+    if(saved!==null)return saved;
+    // Pre-loaded Term 1 calendar (Mayfield Grammar 2026-27)
+    return [{"id":"t1_0","label":"Development Days","date":"2026-09-01","category":"INSET","source":"imported"},{"id":"t1_1","label":"Term 1 begins for students","date":"2026-09-03","category":"general","source":"imported"},{"id":"t1_2","label":"CDT 1","date":"2026-09-04","category":"meeting","source":"imported"},{"id":"t1_3","label":"Tutor/Head of House Briefing","date":"2026-09-07","category":"meeting","source":"imported"},{"id":"t1_4","label":"Curriculum Meeting 1","date":"2026-09-07","category":"meeting","source":"imported"},{"id":"t1_5","label":"School Photographs","date":"2026-09-07","category":"general","source":"imported"},{"id":"t1_6","label":"Staff Briefing","date":"2026-09-09","category":"meeting","source":"imported"},{"id":"t1_7","label":"Fire Drill Main Site","date":"2026-09-09","category":"general","source":"imported"},{"id":"t1_8","label":"Year 10 Parents Meeting","date":"2026-09-10","category":"parents evening","source":"imported"},{"id":"t1_9","label":"Mayfield Test Briefing","date":"2026-09-10","category":"general","source":"imported"},{"id":"t1_10","label":"Kent Test Briefing","date":"2026-09-10","category":"general","source":"imported"},{"id":"t1_11","label":"UCAS References Due","date":"2026-09-11","category":"deadline","source":"imported"},{"id":"t1_12","label":"Mayfield Test","date":"2026-09-12","category":"exam","source":"imported"},{"id":"t1_13","label":"Kent PESE Test","date":"2026-09-13","category":"exam","source":"imported"},{"id":"t1_14","label":"Curriculum and Pastoral Meeting 1","date":"2026-09-14","category":"meeting","source":"imported"},{"id":"t1_15","label":"Invacuation Drill","date":"2026-09-15","category":"general","source":"imported"},{"id":"t1_16","label":"Staff Briefing","date":"2026-09-16","category":"meeting","source":"imported"},{"id":"t1_17","label":"Year 12 Parents Meeting","date":"2026-09-17","category":"parents evening","source":"imported"},{"id":"t1_18","label":"CDT 3: Appraisal Training and Inclusion Review Forum 1","date":"2026-09-18","category":"meeting","source":"imported"},{"id":"t1_19","label":"Tutor/Head of House Briefing","date":"2026-09-21","category":"meeting","source":"imported"},{"id":"t1_20","label":"Twilight 1 (3:30-6pm)","date":"2026-09-21","category":"meeting","source":"imported"},{"id":"t1_21","label":"Year 11 Geography Stratford Trip","date":"2026-09-22","category":"trip","source":"imported"},{"id":"t1_22","label":"Staff Briefing","date":"2026-09-23","category":"meeting","source":"imported"},{"id":"t1_23","label":"AR1 due on SIMS - Yr 13","date":"2026-09-24","category":"deadline","source":"imported"},{"id":"t1_24","label":"CDT 4: AR1 Review Year 13","date":"2026-09-25","category":"meeting","source":"imported"},{"id":"t1_25","label":"Governors Meeting - C&S","date":"2026-09-28","category":"meeting","source":"imported"},{"id":"t1_26","label":"AR1 published - Year 13","date":"2026-09-28","category":"report","source":"imported"},{"id":"t1_27","label":"Staff Briefing","date":"2026-09-30","category":"meeting","source":"imported"},{"id":"t1_28","label":"Year 13 Parents Evening 1 (4-7pm)","date":"2026-09-30","category":"parents evening","source":"imported"},{"id":"t1_29","label":"CDT 5: Appraisal","date":"2026-10-02","category":"meeting","source":"imported"},{"id":"t1_30","label":"Tutor/Head of House Briefing","date":"2026-10-05","category":"meeting","source":"imported"},{"id":"t1_31","label":"Twilight 2 (3:30-6pm)","date":"2026-10-05","category":"meeting","source":"imported"},{"id":"t1_32","label":"Staff Briefing","date":"2026-10-07","category":"meeting","source":"imported"},{"id":"t1_33","label":"Yr 8 Colchester Zoo Trip","date":"2026-10-07","category":"trip","source":"imported"},{"id":"t1_34","label":"Senior Maths Challenge","date":"2026-10-08","category":"exam","source":"imported"},{"id":"t1_35","label":"AR1 due on SIMS - Year 11","date":"2026-10-08","category":"deadline","source":"imported"},{"id":"t1_36","label":"CDT 6: AR1 Review Yr 11 and EPQ Presentation","date":"2026-10-09","category":"meeting","source":"imported"},{"id":"t1_37","label":"PSHE Curriculum Meeting 1","date":"2026-10-12","category":"meeting","source":"imported"},{"id":"t1_38","label":"AR1 published - Year 11","date":"2026-10-13","category":"report","source":"imported"},{"id":"t1_39","label":"Open Morning","date":"2026-10-13","category":"general","source":"imported"},{"id":"t1_40","label":"Open Morning","date":"2026-10-14","category":"general","source":"imported"},{"id":"t1_41","label":"Staff Briefing","date":"2026-10-14","category":"meeting","source":"imported"},{"id":"t1_42","label":"Open Evening","date":"2026-10-15","category":"general","source":"imported"},{"id":"t1_43","label":"UCAS Oxbridge/Medicine/Dentistry/Vet deadline","date":"2026-10-15","category":"deadline","source":"imported"},{"id":"t1_44","label":"CDT 7","date":"2026-10-16","category":"meeting","source":"imported"},{"id":"t1_45","label":"Tutor/Head of House Briefing","date":"2026-10-19","category":"meeting","source":"imported"},{"id":"t1_46","label":"Year 11 Parents Evening 1 (4-7pm)","date":"2026-10-19","category":"parents evening","source":"imported"},{"id":"t1_47","label":"Staff Briefing","date":"2026-10-21","category":"meeting","source":"imported"},{"id":"t1_48","label":"Settling in Reviews due - Yr 9/10/12 and Yr 7 AR1 due","date":"2026-10-21","category":"deadline","source":"imported"},{"id":"t1_49","label":"IYA Testing","date":"2026-10-23","category":"exam","source":"imported"},{"id":"t1_50","label":"Settling in Reviews published Yr 9-10+12","date":"2026-10-23","category":"report","source":"imported"},{"id":"t1_51","label":"CDT 8: Settling in Reviews and AR1 Yr 7","date":"2026-10-23","category":"meeting","source":"imported"},{"id":"t1_52","label":"End of Term 1","date":"2026-10-23","category":"general","source":"imported"},{"id":"t1_53","label":"Iceland Geography Trip begins","date":"2026-10-24","category":"trip","source":"imported"}];
+  });
+
+  // Per-week data
+  const [notes,setNotes]=useState(()=>load('tp_notes',{}));
+  const [reflect,setReflect]=useState(()=>load('tp_refl',{}));
+  const [contacts,setContacts]=useState(()=>load('tp_contacts',{}));
+  const [concerns,setConcerns]=useState(()=>load('tp_concerns',{}));
+  const [cover,setCover]=useState(()=>load('tp_cover',{}));
+
+  // Gist
+  const [gistTok,setGistTok]=useState(()=>load('mzr_gist_token',''));
+  const [gistId,setGistId]=useState(()=>load('mzr_gist_id',''));
+  const [syncSt,setSyncSt]=useState('');
+  const [showSync,setShowSync]=useState(false);
+  const latTok=useRef(gistTok),latGid=useRef(gistId);
+  useEffect(()=>{latTok.current=gistTok},[gistTok]);
+  useEffect(()=>{latGid.current=gistId},[gistId]);
+
+  // UI state
+  const [editTT,setEditTT]=useState(false);
+  const [actCell,setActCell]=useState(null);
+  const [showTTImp,setShowTTImp]=useState(false);
+  const [ttMsg,setTTMsg]=useState('');
+  const [showCalImp,setShowCalImp]=useState(false);
+  const [calBusy,setCalBusy]=useState(false);
+  const [calPrev,setCalPrev]=useState(null);
+  const [calMsg,setCalMsg]=useState('');
+  const [showAddTask,setShowAddTask]=useState(false);
+  const [showDone,setShowDone]=useState(false);
+  const [newTask,setNewTask]=useState({text:'',priority:'medium',category:'teaching',dueDay:-1});
+  const [filterCat,setFilterCat]=useState('all');
+  const [showAddCon,setShowAddCon]=useState(false);
+  const [newCon,setNewCon]=useState({student:'',method:'Call',outcome:'',followUp:''});
+  const [showAddConc,setShowAddConc]=useState(false);
+  const [newConc,setNewConc]=useState({student:'',concern:'',action:'',rag:'amber',followUp:''});
+  const [showAddHw,setShowAddHw]=useState(false);
+  const [newHw,setNewHw]=useState({classGroup:'',task:'',set:'',due:''});
+  const [showAddCov,setShowAddCov]=useState(false);
+  const [newCov,setNewCov]=useState({classGroup:'',day:0,work:''});
+  const [showAddDate,setShowAddDate]=useState(false);
+  const [newDate,setNewDate]=useState({label:'',date:'',category:'general'});
+  const [dbg,setDbg]=useState('');
+  const f1=useRef(),f2=useRef(),fc=useRef();
+
+  const wk=`w${selWeek}`;
+  const wkObj=WEEKS.find(w=>w.id===selWeek)||WEEKS[0];
+  const isTW=selWeek===today.weekId;
+  const autoVer=wkObj.ttW||1;
+  const curVer=ttVer[wk]!==undefined?ttVer[wk]:autoVer;
+  const preset=curVer===2?tt2:tt1;
+
+  // Per-week derived
+  const wkTT={}; // no per-week cell overrides — cells write to preset directly
+  const wkNotes=notes[wk]||'';
+  const wkRefl=reflect[wk]||{wentWell:'',followUp:'',rating:0};
+  const wkCon=contacts[wk]||[];
+  const wkConc=concerns[wk]||[];
+  const wkCov=cover[wk]||[];
+
+  function getTV(di,p){return preset[`${di}_${p}`]||''}
+  function setTV(di,p,v){const k=`${di}_${p}`;if(curVer===2)setTT2(x=>({...x,[k]:v}));else setTT1(x=>({...x,[k]:v}))}
+  function setWkVer(v){setTTVer(x=>({...x,[wk]:v}))}
+  function resetVer(){setTTVer(x=>{const n={...x};delete n[wk];return n})}
+
+  // Persist
+  useEffect(()=>save('tp_dark',dark),[dark]);
+  useEffect(()=>save('tp_week',selWeek),[selWeek]);
+  useEffect(()=>save('tp_todos',todos),[todos]);
+  useEffect(()=>save('tp_hw',hw),[hw]);
+  useEffect(()=>save('tp_tt1',tt1),[tt1]);
+  useEffect(()=>save('tp_tt2',tt2),[tt2]);
+  useEffect(()=>save('tp_tt_ver',ttVer),[ttVer]);
+  useEffect(()=>save('tp_kd',keyDates),[keyDates]);
+  useEffect(()=>save('tp_notes',notes),[notes]);
+  useEffect(()=>save('tp_refl',reflect),[reflect]);
+  useEffect(()=>save('tp_contacts',contacts),[contacts]);
+  useEffect(()=>save('tp_concerns',concerns),[concerns]);
+  useEffect(()=>save('tp_cover',cover),[cover]);
+  useEffect(()=>save('tp_vis',vis),[vis]);
+  useEffect(()=>save('tp_rightcol',rightCol),[rightCol]);
+
+  // Sync
+  function bp(){return{todos,hw,tt1,tt2,ttVer,keyDates,notes,reflect,contacts,concerns,cover,vis,dark}}
+  async function syncNow(){const tok=latTok.current,gid=latGid.current;if(!tok||!gid){setShowSync(true);return}setSyncSt('⏳ Saving…');try{await gistSave(tok,gid,bp());setSyncSt('✅ Saved')}catch(e){setSyncSt('❌ '+e.message)}setTimeout(()=>setSyncSt(''),6000)}
+  async function loadFromGist(){const tok=latTok.current,gid=latGid.current;if(!tok||!gid){setSyncSt('⚠️ No sync');return}setSyncSt('⏳ Loading…');
+    try{const d=await gistLoad(tok,gid);if(d){
+      if(Array.isArray(d.todos))setTodos(d.todos);
+      if(Array.isArray(d.hw))setHw(d.hw);
+      if(d.tt1)setTT1(d.tt1);if(d.tt2)setTT2(d.tt2);if(d.ttVer)setTTVer(d.ttVer);
+      if(Array.isArray(d.keyDates))setKeyDates(d.keyDates);
+      if(d.notes)setNotes(d.notes);if(d.reflect)setReflect(d.reflect);
+      if(d.contacts)setContacts(d.contacts);if(d.concerns)setConcerns(d.concerns);if(d.cover)setCover(d.cover);
+      // legacy
+      if(!d.tt1&&d.presetTT1)setTT1(d.presetTT1);if(!d.tt2&&d.presetTT2)setTT2(d.presetTT2);
+      if(!d.hw&&Array.isArray(d.homework))setHw(d.homework);
+      setSyncSt('✅ Loaded from cloud');
+    }else setSyncSt('ℹ️ Nothing saved yet')}catch(e){setSyncSt('❌ '+e.message)}
+    setTimeout(()=>setSyncSt(''),6000);
+  }
+
+  // Data mutations
+  function addTask(){if(!newTask.text.trim())return;setTodos(p=>[...p,{id:uid(),...newTask,text:newTask.text.trim(),done:false,createdWeek:selWeek}]);setNewTask({text:'',priority:'medium',category:'teaching',dueDay:-1});setShowAddTask(false)}
+  function toggleTask(id){setTodos(p=>p.map(t=>t.id===id?{...t,done:!t.done}:t))}
+  function delTask(id){setTodos(p=>p.filter(t=>t.id!==id))}
+  function addHw(){if(!newHw.classGroup.trim())return;setHw(p=>[...p,{id:uid(),...newHw,returned:false,cw:selWeek}]);setNewHw({classGroup:'',task:'',set:'',due:''});setShowAddHw(false)}
+  function togHw(id){setHw(p=>p.map(h=>h.id===id?{...h,returned:!h.returned}:h))}
+  function delHw(id){setHw(p=>p.filter(h=>h.id!==id))}
+  function addCon(){if(!newCon.student.trim())return;setContacts(p=>({...p,[wk]:[...(p[wk]||[]),{id:uid(),date:new Date().toLocaleDateString('en-GB'),...newCon}]}));setNewCon({student:'',method:'Call',outcome:'',followUp:''});setShowAddCon(false)}
+  function delCon(id){setContacts(p=>({...p,[wk]:(p[wk]||[]).filter(c=>c.id!==id)}))}
+  function addConc(){if(!newConc.student.trim())return;setConcerns(p=>({...p,[wk]:[...(p[wk]||[]),{id:uid(),...newConc}]}));setNewConc({student:'',concern:'',action:'',rag:'amber',followUp:''});setShowAddConc(false)}
+  function updRag(id,rag){setConcerns(p=>({...p,[wk]:(p[wk]||[]).map(c=>c.id===id?{...c,rag}:c)}))}
+  function delConc(id){setConcerns(p=>({...p,[wk]:(p[wk]||[]).filter(c=>c.id!==id)}))}
+  function addCov(){if(!newCov.classGroup.trim())return;setCover(p=>({...p,[wk]:[...(p[wk]||[]),{id:uid(),...newCov}]}));setNewCov({classGroup:'',day:0,work:''});setShowAddCov(false)}
+  function delCov(id){setCover(p=>({...p,[wk]:(p[wk]||[]).filter(c=>c.id!==id)}))}
+  function addDate(){if(!newDate.label.trim()||!newDate.date)return;setKeyDates(p=>[...p,{id:uid(),...newDate}].sort((a,b)=>a.date.localeCompare(b.date)));setNewDate({label:'',date:'',category:'general'});setShowAddDate(false)}
+  function delDate(id){setKeyDates(p=>p.filter(d=>d.id!==id))}
+  function updRefl(f,v){setReflect(p=>({...p,[wk]:{...(p[wk]||{wentWell:'',followUp:'',rating:0}),[f]:v}}))}
+  function togSec(id){setVis(p=>p.includes(id)?p.filter(s=>s!==id):[...p,id])}
+  const isVis=id=>vis.includes(id);
+
+  // Excel import
+  function handleXLS(e,ver){
+    const file=e.target.files[0];if(!file)return;e.target.value='';
+    const r=new FileReader();
+    r.onload=ev=>{try{
+      const wb=XLSX.read(ev.target.result,{type:'binary'});
+      const ws=wb.Sheets[wb.SheetNames[0]];
+      const rows=XLSX.utils.sheet_to_json(ws,{header:1});
+      const dA={mon:0,monday:0,tue:1,tuesday:1,wed:2,wednesday:2,thu:3,thursday:3,fri:4,friday:4};
+      const pA={p1:0,'period 1':0,'1':0,p2:1,'period 2':1,'2':1,p3:2,'period 3':2,'3':2,p4:3,'period 4':3,'4':3,p5:4,'period 5':4,'5':4};
+      let hR=-1,dcm={};
+      for(let r=0;r<Math.min(rows.length,5);r++){const row=rows[r];let f=0;for(let c=0;c<row.length;c++){const cell=String(row[c]||'').trim().toLowerCase();if(dA[cell]!==undefined){dcm[dA[cell]]=c;f++}}if(f>=3){hR=r;break}}
+      if(hR===-1){dcm={0:1,1:2,2:3,3:4,4:5};hR=0}
+      const res={};
+      for(let r=hR+1;r<rows.length;r++){const row=rows[r];const pc=String(row[0]||'').trim().toLowerCase();const pi=pA[pc];if(pi===undefined)continue;for(const[di,col]of Object.entries(dcm)){const v=String(row[col]||'').trim();if(v&&v!=='undefined')res[`${di}_P${pi+1}`]=v}}
+      if(!Object.keys(res).length)setTTMsg('⚠️ Could not read. Check format.');
+      else{ver===2?setTT2(res):setTT1(res);setTTMsg(`✅ Imported ${Object.keys(res).length} classes into Week ${ver}`)}
+    }catch(err){setTTMsg('❌ '+err.message)}};
+    r.readAsBinaryString(file);
+  }
+
+  // Calendar Word import
+  async function handleCal(e){
+    const file=e.target.files[0];if(!file)return;e.target.value='';setCalBusy(true);setCalMsg('');setCalPrev(null);
+    try{
+      const ab=await file.arrayBuffer();const res=await mammoth.extractRawText({arrayBuffer:ab});const txt=res.value;
+      if(!txt||txt.trim().length<20){setCalMsg('⚠️ Could not extract text.');setCalBusy(false);return}
+      const sys=`You are a school calendar parser. Extract every event/date.
+Return ONLY a JSON array. Each item: {"label":"event","date":"YYYY-MM-DD","category":"general|exam|report|parents evening|INSET|assembly|trip|deadline"}
+School year Sep 2026–Jul 2027. Sep-Dec=2026, Jan-Jul=2027. Return [] if nothing found.`;
+      const rsp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:1000,system:sys,messages:[{role:'user',content:txt.slice(0,8000)}]})});
+      const data=await rsp.json();const raw=data.content?.find(b=>b.type==='text')?.text||'[]';
+      const parsed=JSON.parse(raw.replace(/```json|```/g,'').trim());
+      if(!Array.isArray(parsed)||!parsed.length){setCalMsg('⚠️ No dates found.');setCalBusy(false);return}
+      setCalPrev(parsed.map(x=>({...x,id:uid(),keep:true})));setCalMsg(`✅ Found ${parsed.length} events in "${file.name}"`);
+    }catch(err){setCalMsg('❌ '+err.message)}
+    setCalBusy(false);
+  }
+  function togPrev(id){setCalPrev(p=>p.map(x=>x.id===id?{...x,keep:!x.keep}:x))}
+  function confirmCal(){const add=calPrev.filter(x=>x.keep);setKeyDates(p=>[...p.filter(d=>d.source!=='imported'),...add.map(x=>({id:uid(),label:x.label,date:x.date,category:x.category,source:'imported'}))].sort((a,b)=>a.date.localeCompare(b.date)));setCalPrev(null);setCalMsg(`✓ ${add.length} imported`);setShowCalImp(false)}
+
+  // Derived
+  const allTasks=todos.filter(t=>filterCat==='all'||t.category===filterCat).sort((a,b)=>{if(a.done!==b.done)return a.done?1:-1;return({high:0,medium:1,low:2}[a.priority]||1)-({high:0,medium:1,low:2}[b.priority]||1)});
+  const pending=allTasks.filter(t=>!t.done),done=allTasks.filter(t=>t.done);
+  const pct=todos.length?Math.round(todos.filter(t=>t.done).length/todos.length*100):0;
+  const todayStr=new Date().toISOString().slice(0,10);
+  const in14=new Date();in14.setDate(in14.getDate()+14);
+  const upcoming=keyDates.filter(d=>d.date>=todayStr&&d.date<=in14.toISOString().slice(0,10));
+
+  // ── Theme ──
+  const C=dark?{bg:'#0d1117',sur:'#161b22',sur2:'#1c2230',bor:'#30363d',txt:'#e6edf3',mut:'#8b949e',acc:'#818cf8',abg:'#1e2044',ibg:'#0d1117',tbg:'#0d2818',tbor:'#22c55e'}
+              :{bg:'#f0f2f5',sur:'#ffffff',sur2:'#f8fafc',bor:'#e2e8f0',txt:'#0f172a',mut:'#64748b',acc:'#4f46e5',abg:'#eef2ff',ibg:'#f8fafc',tbg:'#f0fdf4',tbor:'#16a34a'};
+  const card={background:C.sur,border:`1px solid ${C.bor}`,borderRadius:12};
+  const lbl={fontSize:10,fontWeight:700,letterSpacing:'0.08em',textTransform:'uppercase',color:C.mut,marginBottom:8,display:'block'};
+  const inp={background:C.ibg,border:`1px solid ${C.bor}`,color:C.txt,borderRadius:8,padding:'7px 10px',fontSize:14,outline:'none',width:'100%',boxSizing:'border-box'};
+  const sel={background:C.ibg,border:`1px solid ${C.bor}`,color:C.txt,borderRadius:8,padding:'6px 9px',fontSize:13,outline:'none',cursor:'pointer'};
+  const btnP={background:C.acc,color:'#fff',border:'none',borderRadius:8,padding:'7px 12px',cursor:'pointer',fontSize:12,fontWeight:600,whiteSpace:'nowrap'};
+  const btnG={background:'transparent',color:C.mut,border:`1px solid ${C.bor}`,borderRadius:8,padding:'6px 11px',cursor:'pointer',fontSize:12,whiteSpace:'nowrap'};
+  const btnX={background:'none',border:'none',cursor:'pointer',color:C.mut,fontSize:12,padding:'2px 5px',lineHeight:1};
+
+  function PBadge({p}){const i=PRI[p];return<span style={{fontSize:10,fontWeight:700,padding:'2px 7px',borderRadius:20,background:dark?i.bgd:i.bg,color:i.c,border:`1px solid ${i.c}44`}}>{i.l}</span>}
+
+  const isRight=id=>rightCol.includes(id);
+  function moveToRight(id){setRightCol(p=>[...p.filter(x=>x!==id),id])}
+  function moveToBottom(id){setRightCol(p=>p.filter(x=>x!==id))}
+  function onPanelDragStart(e,id){dragPanel.current=id;e.dataTransfer.effectAllowed='move'}
+  function onPanelDragOver(e,id,zone){e.preventDefault();dragTarget.current={id,zone}}
+  function onPanelDrop(e,id,zone){
+    e.preventDefault();
+    const src=dragPanel.current;if(!src||src===id)return;
+    if(zone==='right'){
+      setRightCol(p=>{const a=p.filter(x=>x!==src);const i=a.indexOf(id);if(i===-1)return[...a,src];a.splice(i,0,src);return a});
+    } else {
+      setRightCol(p=>p.filter(x=>x!==src));
+    }
+    dragPanel.current=null;dragTarget.current=null;
+  }
+
+  function PanelWrap({id,children,zone='bottom'}){
+    return<div
+      draggable
+      onDragStart={e=>onPanelDragStart(e,id)}
+      onDragOver={e=>onPanelDragOver(e,id,zone)}
+      onDrop={e=>onPanelDrop(e,id,zone)}
+      style={{cursor:'default'}}
+    >{children}</div>;
+  }
+
+  function TRow({t}){
+    const idt=isTW&&t.dueDay===today.dayIdx;
+    const carried=t.createdWeek&&t.createdWeek!==selWeek;
+    return<div style={{display:'flex',alignItems:'flex-start',gap:9,padding:'7px',borderRadius:7,marginBottom:2,background:idt&&!t.done?C.tbg:'transparent',borderLeft:idt&&!t.done?`3px solid ${C.tbor}`:'3px solid transparent'}}>
+      <button onClick={()=>toggleTask(t.id)} style={{flexShrink:0,marginTop:1,width:16,height:16,borderRadius:4,border:`2px solid ${t.done?C.acc:C.bor}`,background:t.done?C.acc:'transparent',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>
+        {t.done&&<span style={{color:'#fff',fontSize:9,fontWeight:800}}>✓</span>}
+      </button>
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{fontWeight:500,fontSize:12,marginBottom:2}}>{t.text}</div>
+        <div style={{display:'flex',gap:5,flexWrap:'wrap',alignItems:'center'}}>
+          <PBadge p={t.priority}/>
+          <span style={{fontSize:10,color:C.mut}}>{CATS[t.category]}</span>
+          {t.dueDay>=0&&<span style={{fontSize:10,color:idt?C.tbor:C.mut}}>📅 {DS[t.dueDay]}</span>}
+          {carried&&!t.done&&<span style={{fontSize:10,color:'#f59e0b',background:dark?'#3b2700':'#fffbeb',padding:'1px 5px',borderRadius:20,border:'1px solid #f59e0b44'}}>carried</span>}
+        </div>
+      </div>
+      <button onClick={()=>delTask(t.id)} style={btnX}>✕</button>
+    </div>;
+  }
+
+  function SHead({title,id,actions,zone='bottom'}){return(
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 14px',borderBottom:`1px solid ${C.bor}`,background:C.sur2,borderRadius:'12px 12px 0 0',flexWrap:'wrap',gap:6}}>
+      <div style={{display:'flex',alignItems:'center',gap:6}}>
+        <span style={{cursor:'grab',color:C.mut,fontSize:13,userSelect:'none'}} title="Drag to reorder">⠿</span>
+        <span style={{fontWeight:700,fontSize:13}}>{title}</span>
+      </div>
+      <div style={{display:'flex',gap:6,alignItems:'center'}}>
+        {actions}
+        {id!=='timetable'&&<button onClick={()=>isRight(id)?moveToBottom(id):moveToRight(id)} style={{...btnX,fontSize:11,color:C.mut,border:`1px solid ${C.bor}`,borderRadius:6,padding:'2px 6px'}} title={isRight(id)?'Move to bottom':'Move to side'}>{isRight(id)?'⬇':'⬆'}</button>}
+        <button onClick={()=>togSec(id)} style={{...btnX,fontSize:14,opacity:0.5}}>✕</button>
+      </div>
+    </div>
+  )}
+
+  function TTCell({di,p}){
+    const val=getTV(di,p),isT=isTW&&di===today.dayIdx,isA=actCell===`${di}_${p}`;
+    const opts=[...new Set(Object.values(preset).filter(Boolean))];
+    return<div style={{position:'relative',borderRadius:6,border:`1px solid ${isT?C.tbor+'55':C.bor}`,background:val?(dark?'#6366f118':'#eef2ff'):(isT?C.tbg:C.ibg),minHeight:28,display:'flex',alignItems:'center',justifyContent:'center',padding:'2px 4px',cursor:editTT?'text':'default'}}
+      onClick={()=>editTT&&setActCell(isA?null:`${di}_${p}`)}>
+      {editTT&&isA?<div style={{position:'absolute',top:0,left:0,right:0,zIndex:50}}>
+        <input autoFocus style={{...inp,borderRadius:'7px 7px 0 0',fontSize:11,textAlign:'center',fontWeight:600}} value={val} placeholder="Class…" onChange={e=>setTV(di,p,e.target.value)} onBlur={()=>setTimeout(()=>setActCell(null),150)}/>
+        {opts.length>0&&<div style={{background:C.sur,border:`1px solid ${C.bor}`,borderRadius:'0 0 7px 7px',maxHeight:130,overflowY:'auto',boxShadow:'0 4px 12px rgba(0,0,0,0.15)'}}>
+          <div style={{padding:'3px 8px',fontSize:10,color:C.mut,fontWeight:700,borderBottom:`1px solid ${C.bor}`}}>From timetable</div>
+          {opts.map(o=><div key={o} onMouseDown={()=>{setTV(di,p,o);setActCell(null)}} style={{padding:'5px 10px',fontSize:11,cursor:'pointer',color:C.txt}} onMouseEnter={e=>e.currentTarget.style.background=C.abg} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>{o}</div>)}
+          <div onMouseDown={()=>{setTV(di,p,'');setActCell(null)}} style={{padding:'5px 10px',fontSize:11,cursor:'pointer',color:'#ef4444'}} onMouseEnter={e=>e.currentTarget.style.background=C.sur2} onMouseLeave={e=>e.currentTarget.style.background='transparent'}>Clear</div>
+        </div>}
+      </div>:<span style={{fontSize:11,fontWeight:val?600:400,color:val?C.acc:C.mut,opacity:val?1:0.35}}>{val||'—'}</span>}
+    </div>;
+  }
+
+  // Focus mode
+  if(focusMode)return<div style={{background:C.bg,color:C.txt,minHeight:'100vh',fontFamily:'inherit'}}>
+    <div style={{background:C.sur,borderBottom:`1px solid ${C.bor}`,padding:'10px 18px',display:'flex',alignItems:'center',gap:10}}>
+      <span style={{fontWeight:800,fontSize:15,color:C.acc}}>🎯 Focus</span>
+      <span style={{flex:1,color:C.mut,fontSize:12}}>{DAYS[today.dayIdx]} — {dayFmt(wkObj.monday,today.dayIdx)}</span>
+      <button style={btnG} onClick={()=>setFocusMode(false)}>✕ Exit</button>
+    </div>
+    <div style={{maxWidth:640,margin:'24px auto',padding:'0 16px'}}>
+      <div style={{...card,padding:18,marginBottom:14}}>
+        <span style={lbl}>Today's classes</span>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:6}}>{PER.map(p=>{const v=getTV(today.dayIdx,p);return<div key={p} style={{textAlign:'center',background:v?C.abg:C.sur2,border:`1px solid ${v?C.acc:C.bor}`,borderRadius:8,padding:'7px 4px'}}><div style={{fontSize:10,color:C.mut,marginBottom:1}}>{p}</div><div style={{fontSize:11,fontWeight:700,color:v?C.acc:C.mut}}>{v||'—'}</div></div>})}</div>
+      </div>
+      <div style={{...card,padding:18}}>
+        <span style={lbl}>Tasks for today ({pending.filter(t=>t.dueDay===today.dayIdx||t.dueDay===-1).length})</span>
+        {pending.filter(t=>t.dueDay===today.dayIdx||t.dueDay===-1).length===0?<div style={{color:C.mut,fontSize:12,textAlign:'center',padding:'14px 0'}}>All clear ✨</div>:pending.filter(t=>t.dueDay===today.dayIdx||t.dueDay===-1).map(t=><TRow key={t.id} t={t}/>)}
+      </div>
+    </div>
+  </div>;
+
+  // ── MAIN RENDER ──
+  const todayStr2=new Date().toISOString().slice(0,10);
+
+  return<div style={{background:C.bg,color:C.txt,minHeight:'100vh',fontFamily:"'Inter',system-ui,sans-serif",fontSize:16,transition:'background 0.2s'}}>
+
+    {/* HEADER */}
+    <div style={{background:C.sur,borderBottom:`1px solid ${C.bor}`,padding:'9px 16px',display:'flex',alignItems:'center',gap:9,position:'sticky',top:0,zIndex:200,boxShadow:'0 1px 4px rgba(0,0,0,0.06)',flexWrap:'wrap'}}>
+      <span style={{fontWeight:800,fontSize:15,color:C.acc,whiteSpace:'nowrap'}}>🎓 MZR Planner</span>
+      <select style={{...sel,flex:1,minWidth:160,fontSize:12}} value={selWeek} onChange={e=>setSelWeek(Number(e.target.value))}>{WEEKS.map(w=><option key={w.id} value={w.id}>{w.label}</option>)}</select>
+      {isTW&&<span style={{fontSize:11,fontWeight:600,color:'#22c55e',background:dark?'#052e16':'#f0fdf4',border:'1px solid #22c55e44',borderRadius:20,padding:'2px 8px',whiteSpace:'nowrap'}}>This week</span>}
+      {upcoming.length>0&&<span style={{fontSize:11,fontWeight:600,color:'#f59e0b',background:dark?'#3b2700':'#fffbeb',border:'1px solid #f59e0b44',borderRadius:20,padding:'2px 8px',whiteSpace:'nowrap'}}>📌 {upcoming.length} upcoming</span>}
+      {syncSt&&<span style={{fontSize:11,color:syncSt.includes('❌')?'#ef4444':syncSt.includes('✅')?'#22c55e':'#f59e0b',whiteSpace:'nowrap'}}>{syncSt}</span>}
+      <button style={{...btnG,padding:'5px 9px'}} onClick={async()=>{const tok=latTok.current,gid=latGid.current;const p=bp();let m=`Token: ${tok?tok.slice(0,10)+'...':'MISSING'}\nGist: ${gid||'MISSING'}\nLocal tasks: ${p.todos.length}`;try{if(tok&&gid){const d=await gistLoad(tok,gid);m+=`\nGist tasks: ${(d?.todos||[]).length}`;}}catch(e){m+=`\nError: ${e.message}`}setDbg(m)}} title="Debug">🔍</button>
+      <button style={{...btnG,padding:'5px 9px'}} onClick={loadFromGist} title="Load from cloud">⬇️</button>
+      <button style={{...btnG,padding:'5px 9px'}} onClick={syncNow} title="Save to cloud">☁️</button>
+      <button style={{...btnG,padding:'5px 9px'}} onClick={()=>setFocusMode(true)} title="Focus">🎯</button>
+      <button style={{...btnG,padding:'5px 9px'}} onClick={()=>setShowManage(m=>!m)} title="Sections">⚙️</button>
+      <button style={{...btnG,padding:'5px 9px',fontSize:14}} onClick={()=>setDark(d=>!d)}>{dark?'☀️':'🌙'}</button>
+    </div>
+
+    {/* DEBUG */}
+    {dbg&&<div style={{background:'#1e293b',color:'#94a3b8',padding:'10px 16px',fontFamily:'monospace',fontSize:11,lineHeight:1.8,whiteSpace:'pre-wrap',borderBottom:'1px solid #334155',position:'relative'}}>
+      <strong style={{color:'#f1f5f9'}}>🔍 Debug</strong>{'\n'}{dbg}
+      <button onClick={()=>setDbg('')} style={{position:'absolute',top:8,right:12,background:'none',border:'none',color:'#94a3b8',cursor:'pointer',fontSize:14}}>✕</button>
+    </div>}
+
+    {/* UPCOMING BANNER */}
+    {upcoming.length>0&&<div style={{background:dark?'#3b2700':'#fffbeb',borderBottom:'1px solid #f59e0b44',padding:'6px 16px',display:'flex',gap:10,alignItems:'center',flexWrap:'wrap'}}>
+      <span style={{fontSize:10,fontWeight:700,color:'#f59e0b',textTransform:'uppercase',letterSpacing:'0.07em',whiteSpace:'nowrap'}}>📌 Coming up</span>
+      {upcoming.map(d=><span key={d.id} style={{fontSize:11,background:dark?'#4a3200':'#fef3c7',border:'1px solid #f59e0b44',borderRadius:20,padding:'2px 9px',color:dark?'#fbbf24':'#92400e',whiteSpace:'nowrap'}}>{new Date(d.date+'T00:00:00').toLocaleDateString('en-GB',{day:'numeric',month:'short'})} — {d.label}</span>)}
+    </div>}
+
+    {/* SECTION MANAGER */}
+    {showManage&&<div style={{background:C.sur,borderBottom:`1px solid ${C.bor}`,padding:'12px 16px',display:'flex',gap:7,flexWrap:'wrap',alignItems:'center'}}>
+      <span style={{fontSize:12,fontWeight:700,color:C.mut,marginRight:4}}>Sections:</span>
+      {[{id:'timetable',l:'📅 Timetable'},{id:'tasks',l:'✅ Tasks'},{id:'stats',l:'📊 Stats'},{id:'hoy',l:'🧑‍🤝‍🧑 HOY'},{id:'homework',l:'✏️ Homework'},{id:'cover',l:'🔄 Cover'},{id:'keydates',l:'📌 Key Dates'},{id:'notes',l:'📝 Notes'},{id:'reflect',l:'💬 Reflect'}].map(s=>(
+        <button key={s.id} onClick={()=>togSec(s.id)} style={{...isVis(s.id)?btnP:btnG,fontSize:11,padding:'4px 10px'}}>{isVis(s.id)?'✓ ':''}{s.l}</button>
+      ))}
+      {gistTok&&<button style={{...btnG,fontSize:11,color:'#f59e0b',borderColor:'#f59e0b33'}} onClick={()=>{const id=prompt('Enter Gist ID:');if(id?.trim()){save('mzr_gist_id',id.trim());setGistId(id.trim());setSyncSt('✅ Gist ID updated')}}}>🔧 Set Gist ID</button>}
+      {gistTok&&<button style={{...btnG,fontSize:11,color:'#ef4444',borderColor:'#ef444433'}} onClick={()=>{if(confirm('Disconnect?')){save('mzr_gist_token','');save('mzr_gist_id','');setGistTok('');setGistId('')}}}>Disconnect sync</button>}
+      {!gistTok&&<button style={{...btnG,fontSize:11,color:'#22c55e',borderColor:'#22c55e33'}} onClick={()=>setShowSync(true)}>+ Enable sync</button>}
+      <button style={{...btnX,marginLeft:'auto',fontSize:12}} onClick={()=>setShowManage(false)}>Done</button>
+    </div>}
+
+    {/* GIST SETUP */}
+    {showSync&&<GistSetup dark={dark} onDone={(t,id)=>{setGistTok(t);setGistId(id);setShowSync(false);setSyncSt('✅ Sync enabled')}} onSkip={()=>setShowSync(false)}/>}
+
+    <div style={{padding:'12px 12px 40px'}}>
+
+      {/* PROGRESS BAR */}
+      <div style={{...card,padding:'10px 14px',marginBottom:12}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:4}}>
+          <span style={{fontSize:10,fontWeight:700,color:C.mut,textTransform:'uppercase',letterSpacing:'0.07em'}}>Weekly Overview</span>
+          <span style={{fontSize:12,fontWeight:700,color:C.acc}}>{pct}% — {todos.filter(t=>t.done).length}/{todos.length} tasks done</span>
+        </div>
+        <div style={{height:5,background:C.bor,borderRadius:3,overflow:'hidden'}}><div style={{height:'100%',width:`${pct}%`,background:`linear-gradient(90deg,${C.acc},#a855f7)`,borderRadius:3,transition:'width 0.4s'}}/></div>
+        <div style={{display:'flex',gap:10,marginTop:6,flexWrap:'wrap'}}>{Object.entries(CATS).map(([c,ic])=>{const n=todos.filter(t=>t.category===c&&!t.done).length;return n>0?<span key={c} style={{fontSize:10,color:C.mut}}>{ic} {n} {c}</span>:null})}</div>
+      </div>
+
+      {/* MAIN GRID: timetable (large left) + right column */}
+      <div style={{display:'flex',flexDirection:'row',gap:12,marginBottom:12,alignItems:'flex-start'}}>
+
+        {/* TIMETABLE */}
+        {isVis('timetable')&&<div style={{...card,flex:1,minWidth:0}}>
+          <SHead title="📅 Timetable" id="timetable" actions={<>
+            <button style={btnG} onClick={()=>setShowTTImp(s=>!s)}>📂 Import</button>
+            <button style={editTT?btnP:btnG} onClick={()=>{setEditTT(e=>!e);setActCell(null)}}>{editTT?'✓ Done':'✏️ Edit'}</button>
+          </>}/>
+          <div style={{padding:'10px 10px 8px'}}>
+            <input ref={f1} type="file" accept=".xlsx,.xls,.csv" style={{display:'none'}} onChange={e=>handleXLS(e,1)}/>
+            <input ref={f2} type="file" accept=".xlsx,.xls,.csv" style={{display:'none'}} onChange={e=>handleXLS(e,2)}/>
+            <input ref={fc} type="file" accept=".docx,.doc" style={{display:'none'}} onChange={handleCal}/>
+            {/* TT Week toggle */}
+            <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:8,flexWrap:'wrap'}}>
+              <span style={{fontSize:11,color:C.mut,fontWeight:600}}>Timetable week:</span>
+              {[1,2].map(v=><button key={v} onClick={()=>setWkVer(v)} style={{padding:'4px 14px',borderRadius:20,fontSize:12,fontWeight:600,cursor:'pointer',border:`1px solid ${curVer===v?C.acc:C.bor}`,background:curVer===v?C.abg:'transparent',color:curVer===v?C.acc:C.mut,transition:'all 0.15s'}}>Week {v}</button>)}
+              {ttVer[wk]!==undefined?<button onClick={resetVer} style={{...btnG,fontSize:11,color:'#f59e0b',borderColor:'#f59e0b44'}}>↺ Auto (Week {autoVer})</button>:<span style={{fontSize:11,color:'#22c55e'}}>✓ Auto (Week {autoVer})</span>}
+            </div>
+            {/* Import panel */}
+            {showTTImp&&<div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:10,padding:12,marginBottom:12}}>
+              <div style={{fontWeight:600,marginBottom:6,fontSize:13}}>Import timetable from Excel</div>
+              <div style={{fontSize:11,color:C.mut,marginBottom:10,lineHeight:1.7}}>Row 1: blank, Mon, Tue, Wed, Thu, Fri. Rows 2–6: P1–P5 with class names.</div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:8}}>
+                <div style={{background:C.sur,border:`1px solid ${C.bor}`,borderRadius:8,padding:10}}>
+                  <div style={{fontWeight:600,fontSize:11,marginBottom:7,color:C.acc}}>📅 Week 1</div>
+                  <button style={{...btnP,fontSize:11}} onClick={()=>f1.current.click()}>📂 Import Week 1</button>
+                  {Object.keys(tt1).length>0&&<><button style={{...btnG,fontSize:10,color:'#ef4444',borderColor:'#ef444433',marginLeft:6}} onClick={()=>{setTT1({});setTTMsg('')}}>Clear</button><div style={{fontSize:10,color:'#22c55e',marginTop:5}}>✓ {Object.keys(tt1).length} classes</div></>}
+                </div>
+                <div style={{background:C.sur,border:`1px solid ${C.bor}`,borderRadius:8,padding:10}}>
+                  <div style={{fontWeight:600,fontSize:11,marginBottom:7,color:C.acc}}>📅 Week 2</div>
+                  <button style={{...btnP,fontSize:11}} onClick={()=>f2.current.click()}>📂 Import Week 2</button>
+                  {Object.keys(tt2).length>0&&<><button style={{...btnG,fontSize:10,color:'#ef4444',borderColor:'#ef444433',marginLeft:6}} onClick={()=>{setTT2({});setTTMsg('')}}>Clear</button><div style={{fontSize:10,color:'#22c55e',marginTop:5}}>✓ {Object.keys(tt2).length} classes</div></>}
+                </div>
+              </div>
+              {ttMsg&&<div style={{fontSize:12,fontWeight:600,color:ttMsg.startsWith('✅')?'#22c55e':'#f59e0b',marginBottom:8}}>{ttMsg}</div>}
+              <button style={btnG} onClick={()=>setShowTTImp(false)}>Close</button>
+            </div>}
+            {/* Grid */}
+            <div style={{display:'grid',gridTemplateColumns:'26px repeat(5,1fr)',gap:3}}>
+              <div/>
+              {DAYS.map((_,i)=><div key={i} style={{textAlign:'center',padding:'4px 2px',borderRadius:6,fontSize:11,fontWeight:700,color:isTW&&i===today.dayIdx?C.tbor:C.mut,background:isTW&&i===today.dayIdx?C.tbg:'transparent',border:isTW&&i===today.dayIdx?`1px solid ${C.tbor}44`:'1px solid transparent'}}>
+                {DS[i]}<div style={{fontSize:10,fontWeight:400,opacity:0.7}}>{dayFmt(wkObj.monday,i)}</div>
+              </div>)}
+              {PER.map(period=><React.Fragment key={period}>
+                <div style={{display:'flex',alignItems:'center',justifyContent:'flex-end',paddingRight:5,fontSize:10,fontWeight:700,color:C.mut}}>{period}</div>
+                {DAYS.map((_,di)=><TTCell key={`${di}_${period}`} di={di} p={period}/>)}
+              </React.Fragment>)}
+            </div>
+            {editTT&&<div style={{marginTop:9,fontSize:11,color:C.mut}}>Click a cell to edit. Changes apply to all weeks with the same timetable week.</div>}
+          </div>
+        </div>}
+
+        {/* RIGHT COLUMN — panels assigned here */}
+        <div style={{display:'flex',flexDirection:'column',gap:12,width:320,flexShrink:0}}>
+          {rightCol.filter(id=>isVis(id)).map(id=>(
+            <PanelWrap key={id} id={id} zone="right"><PanelContent id={id}/></PanelWrap>
+          ))}
+          {rightCol.filter(id=>isVis(id)).length===0&&<div style={{...card,padding:20,textAlign:'center',color:C.mut,fontSize:12,border:`2px dashed ${C.bor}`,background:'transparent'}}>Use ⬆ on any panel to pin it here</div>}
+        </div>
+      </div>
+
+      {/* BOTTOM — panels not pinned to right column */}
+      {['tasks','stats','notes','hoy','homework','cover','keydates','reflect'].filter(id=>isVis(id)&&!rightCol.includes(id)).map(id=>(
+        <PanelWrap key={id} id={id} zone="bottom">
+          <div style={{marginBottom:12}}><PanelContent id={id}/></div>
+        </PanelWrap>
+      ))}
+
+    </div>
+  </div>;
+
+  function PanelContent({id}){
+    const inRight=isRight(id);
+
+    if(id==='tasks')return<div style={card}>
+      <SHead title="✅ Tasks" id="tasks" actions={<><select style={{...sel,fontSize:11,padding:'4px 7px'}} value={filterCat} onChange={e=>setFilterCat(e.target.value)}><option value="all">All</option>{Object.entries(CATS).map(([c,ic])=><option key={c} value={c}>{ic} {c}</option>)}</select><button style={btnP} onClick={()=>setShowAddTask(s=>!s)}>{showAddTask?'✕':'+ Add'}</button></>}/>
+      <div style={{padding:12,overflowY:'auto'}}>
+        {showAddTask&&<div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:9,padding:10,marginBottom:10}}>
+          <input style={inp} autoFocus placeholder="Task…" value={newTask.text} onChange={e=>setNewTask(p=>({...p,text:e.target.value}))} onKeyDown={e=>e.key==='Enter'&&addTask()}/>
+          <div style={{display:'flex',gap:6,marginTop:7,flexWrap:'wrap'}}>
+            <select style={sel} value={newTask.priority} onChange={e=>setNewTask(p=>({...p,priority:e.target.value}))}><option value="high">🔴 High</option><option value="medium">🟡 Med</option><option value="low">🟢 Low</option></select>
+            <select style={sel} value={newTask.category} onChange={e=>setNewTask(p=>({...p,category:e.target.value}))}>{Object.entries(CATS).map(([c,ic])=><option key={c} value={c}>{ic} {c}</option>)}</select>
+            <select style={sel} value={newTask.dueDay} onChange={e=>setNewTask(p=>({...p,dueDay:Number(e.target.value)}))}><option value={-1}>Any</option>{DAYS.map((d,i)=><option key={i} value={i}>{DS[i]}</option>)}</select>
+            <button style={btnP} onClick={addTask}>Add</button>
+          </div>
+        </div>}
+        {pending.length===0?<div style={{textAlign:'center',color:C.mut,padding:'16px 0'}}><div style={{fontSize:20,marginBottom:3}}>✨</div>All clear</div>:pending.map(t=><TRow key={t.id} t={t}/>)}
+        {done.length>0&&<div style={{marginTop:8}}><button onClick={()=>setShowDone(s=>!s)} style={{display:'flex',alignItems:'center',gap:6,background:'none',border:'none',cursor:'pointer',color:C.mut,fontSize:11,fontWeight:600,padding:'4px 0',width:'100%'}}><span style={{fontSize:9,display:'inline-block',transform:showDone?'rotate(90deg)':'rotate(0deg)',transition:'transform 0.2s'}}>▶</span>Completed ({done.length})<div style={{flex:1,height:1,background:C.bor,marginLeft:4}}/></button>{showDone&&<div style={{opacity:0.5}}>{done.map(t=><TRow key={t.id} t={t}/>)}</div>}</div>}
+      </div>
+    </div>;
+
+    if(id==='stats')return<div style={card}>
+      <SHead title="📊 Stats" id="stats" actions={null}/>
+      <div style={{padding:12}}>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(2,1fr)',gap:7,marginBottom:10}}>{[{l:'Total',v:todos.length,ic:'📋',c:C.mut},{l:'Done',v:todos.filter(t=>t.done).length,ic:'✅',c:'#22c55e'},{l:'Pending',v:todos.filter(t=>!t.done).length,ic:'⏳',c:C.acc},{l:'Urgent',v:todos.filter(t=>t.priority==='high'&&!t.done).length,ic:'🔴',c:'#ef4444'}].map(s=><div key={s.l} style={{background:C.sur2,border:`1px solid ${C.bor}`,borderRadius:8,padding:'8px',textAlign:'center'}}><div style={{fontSize:16}}>{s.ic}</div><div style={{fontSize:18,fontWeight:800,color:s.c,lineHeight:1.2}}>{s.v}</div><div style={{fontSize:10,color:C.mut}}>{s.l}</div></div>)}</div>
+        {Object.entries(CATS).map(([cat,ic])=>{const tot=todos.filter(t=>t.category===cat).length;if(!tot)return null;const dn=todos.filter(t=>t.category===cat&&t.done).length;return<div key={cat} style={{marginBottom:7}}><div style={{display:'flex',justifyContent:'space-between',marginBottom:2}}><span style={{fontSize:10}}>{ic} {cat}</span><span style={{fontSize:10,color:C.mut}}>{dn}/{tot}</span></div><div style={{height:3,background:C.bor,borderRadius:2,overflow:'hidden'}}><div style={{height:'100%',width:`${Math.round(dn/tot*100)}%`,background:C.acc,borderRadius:2}}/></div></div>;})}
+        {!todos.length&&<div style={{fontSize:11,color:C.mut,textAlign:'center'}}>Add tasks to see stats</div>}
+      </div>
+    </div>;
+
+    if(id==='notes')return<div style={card}>
+      <SHead title="📝 Week Notes" id="notes" actions={null}/>
+      <div style={{padding:12}}><textarea style={{...inp,resize:'vertical',minHeight:inRight?100:80,lineHeight:1.6,fontFamily:'inherit'}} placeholder="HOY notes, welfare, deadlines…" value={wkNotes} onChange={e=>setNotes(p=>({...p,[wk]:e.target.value}))}/></div>
+    </div>;
+
+    if(id==='hoy')return<div style={card}>
+      <SHead title="🧑‍🤝‍🧑 HOY — Concerns & Contacts" id="hoy" actions={<><button style={btnP} onClick={()=>setShowAddConc(s=>!s)}>{showAddConc?'✕':'+ Concern'}</button><button style={btnG} onClick={()=>setShowAddCon(s=>!s)}>{showAddCon?'✕':'+ Contact'}</button></>}/>
+      <div style={{padding:14}}>
+        {showAddConc&&<div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:10,padding:12,marginBottom:12}}><div style={{fontWeight:600,fontSize:12,marginBottom:9,color:C.acc}}>New concern</div><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}><input style={inp} placeholder="Student name" value={newConc.student} onChange={e=>setNewConc(p=>({...p,student:e.target.value}))}/><select style={{...sel,width:'100%'}} value={newConc.rag} onChange={e=>setNewConc(p=>({...p,rag:e.target.value}))}><option value="red">🔴 Red</option><option value="amber">🟡 Amber</option><option value="green">🟢 Green</option></select></div><textarea style={{...inp,marginBottom:8,resize:'vertical',minHeight:50}} placeholder="Concern" value={newConc.concern} onChange={e=>setNewConc(p=>({...p,concern:e.target.value}))}/><textarea style={{...inp,marginBottom:8,resize:'vertical',minHeight:44}} placeholder="Action taken" value={newConc.action} onChange={e=>setNewConc(p=>({...p,action:e.target.value}))}/><div style={{display:'flex',gap:8}}><input style={{...inp,flex:1}} placeholder="Follow-up date" value={newConc.followUp} onChange={e=>setNewConc(p=>({...p,followUp:e.target.value}))}/><button style={btnP} onClick={addConc}>Save</button></div></div>}
+        {showAddCon&&<div style={{background:dark?'#1a1a2e':'#f5f3ff',border:'1px solid #8b5cf644',borderRadius:10,padding:12,marginBottom:12}}><div style={{fontWeight:600,fontSize:12,marginBottom:9,color:'#8b5cf6'}}>Log contact</div><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}><input style={inp} placeholder="Student name" value={newCon.student} onChange={e=>setNewCon(p=>({...p,student:e.target.value}))}/><select style={{...sel,width:'100%'}} value={newCon.method} onChange={e=>setNewCon(p=>({...p,method:e.target.value}))}>{CM.map(m=><option key={m}>{m}</option>)}</select></div><textarea style={{...inp,marginBottom:8,resize:'vertical',minHeight:50}} placeholder="Outcome" value={newCon.outcome} onChange={e=>setNewCon(p=>({...p,outcome:e.target.value}))}/><div style={{display:'flex',gap:8}}><input style={{...inp,flex:1}} placeholder="Next step" value={newCon.followUp} onChange={e=>setNewCon(p=>({...p,followUp:e.target.value}))}/><button style={btnP} onClick={addCon}>Log</button></div></div>}
+        {wkConc.length>0&&<>{wkConc.map(c=><div key={c.id} style={{borderRadius:10,border:`1px solid ${RAG[c.rag].c}44`,padding:12,marginBottom:8,background:dark?RAG[c.rag].bgd:RAG[c.rag].bg+'88'}}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:5}}><span style={{fontWeight:700}}>{c.student}</span><div style={{display:'flex',gap:6,alignItems:'center'}}><select style={{...sel,fontSize:11,padding:'3px 7px'}} value={c.rag} onChange={e=>updRag(c.id,e.target.value)}><option value="red">🔴</option><option value="amber">🟡</option><option value="green">🟢</option></select><button style={btnX} onClick={()=>delConc(c.id)}>✕</button></div></div>{c.concern&&<div style={{fontSize:12,marginBottom:3}}><span style={{color:C.mut,fontWeight:600}}>Concern: </span>{c.concern}</div>}{c.action&&<div style={{fontSize:12,marginBottom:3}}><span style={{color:C.mut,fontWeight:600}}>Action: </span>{c.action}</div>}{c.followUp&&<div style={{fontSize:11,color:C.mut}}>📅 {c.followUp}</div>}</div>)}</>}
+        {wkCon.length>0&&<div style={{overflowX:'auto'}}><table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}><thead><tr style={{borderBottom:`2px solid ${C.bor}`}}>{['Date','Student','Method','Outcome','Next step',''].map(h=><th key={h} style={{textAlign:'left',padding:'5px 8px',color:C.mut,fontWeight:600,fontSize:11,whiteSpace:'nowrap'}}>{h}</th>)}</tr></thead><tbody>{wkCon.map(c=><tr key={c.id} style={{borderBottom:`1px solid ${C.bor}`}}><td style={{padding:'7px 8px',color:C.mut,whiteSpace:'nowrap'}}>{c.date}</td><td style={{padding:'7px 8px',fontWeight:600}}>{c.student}</td><td style={{padding:'7px 8px'}}><span style={{background:C.abg,color:C.acc,borderRadius:20,padding:'1px 7px',fontSize:11,fontWeight:600}}>{c.method}</span></td><td style={{padding:'7px 8px',maxWidth:200}}>{c.outcome}</td><td style={{padding:'7px 8px',maxWidth:160,color:C.mut}}>{c.followUp}</td><td style={{padding:'7px 8px'}}><button style={btnX} onClick={()=>delCon(c.id)}>✕</button></td></tr>)}</tbody></table></div>}
+        {wkConc.length===0&&wkCon.length===0&&<div style={{color:C.mut,fontSize:12,textAlign:'center',padding:'20px 0'}}>No concerns or contacts logged this week</div>}
+      </div>
+    </div>;
+
+    if(id==='homework')return<div style={card}>
+      <SHead title="✏️ Homework & Deadline Tracker" id="homework" actions={<button style={btnP} onClick={()=>setShowAddHw(s=>!s)}>{showAddHw?'✕':'+ Add'}</button>}/>
+      <div style={{padding:14}}>
+        {showAddHw&&<div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:10,padding:12,marginBottom:12}}><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}><input style={inp} placeholder="Class / group" value={newHw.classGroup} onChange={e=>setNewHw(p=>({...p,classGroup:e.target.value}))}/><input style={inp} placeholder="Task" value={newHw.task} onChange={e=>setNewHw(p=>({...p,task:e.target.value}))}/><input style={inp} placeholder="Date set" value={newHw.set} onChange={e=>setNewHw(p=>({...p,set:e.target.value}))}/><input style={inp} placeholder="Due date" value={newHw.due} onChange={e=>setNewHw(p=>({...p,due:e.target.value}))}/></div><button style={btnP} onClick={addHw}>Add</button></div>}
+        {hw.length===0?<div style={{color:C.mut,fontSize:12,textAlign:'center',padding:'20px 0'}}>No homework logged yet</div>:hw.map(h=><div key={h.id} style={{display:'flex',alignItems:'flex-start',gap:10,padding:'9px',borderRadius:8,marginBottom:5,background:h.returned?(dark?'#052e16':'#f0fdf4'):C.sur2,border:`1px solid ${h.returned?'#22c55e44':C.bor}`,opacity:h.returned?0.6:1}}><button onClick={()=>togHw(h.id)} style={{flexShrink:0,marginTop:2,width:16,height:16,borderRadius:4,border:`2px solid ${h.returned?'#22c55e':C.bor}`,background:h.returned?'#22c55e':'transparent',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{h.returned&&<span style={{color:'#fff',fontSize:9,fontWeight:800}}>✓</span>}</button><div style={{flex:1}}><div style={{fontWeight:700,marginBottom:2,fontSize:12}}>{h.classGroup}</div><div style={{fontSize:11,color:C.mut,marginBottom:2}}>{h.task}</div><div style={{display:'flex',gap:8,fontSize:10,color:C.mut,flexWrap:'wrap'}}>{h.set&&<span>Set: {h.set}</span>}{h.due&&<span style={{color:h.returned?'#22c55e':'#f59e0b',fontWeight:600}}>Due: {h.due}</span>}{h.cw&&h.cw!==selWeek&&!h.returned&&<span style={{color:'#f59e0b',background:dark?'#3b2700':'#fffbeb',padding:'1px 5px',borderRadius:20,border:'1px solid #f59e0b44'}}>carried</span>}</div></div><div style={{display:'flex',gap:5,alignItems:'center',flexShrink:0}}><span style={{fontSize:10,color:h.returned?'#22c55e':C.mut}}>{h.returned?'Returned':'Pending'}</span><button style={btnX} onClick={()=>delHw(h.id)}>✕</button></div></div>)}
+      </div>
+    </div>;
+
+    if(id==='cover')return<div style={card}>
+      <SHead title="🔄 Cover & Absence Notes" id="cover" actions={<button style={btnP} onClick={()=>setShowAddCov(s=>!s)}>{showAddCov?'✕':'+ Add'}</button>}/>
+      <div style={{padding:14}}>
+        {showAddCov&&<div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:10,padding:12,marginBottom:12}}><div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginBottom:8}}><input style={inp} placeholder="Class / group" value={newCov.classGroup} onChange={e=>setNewCov(p=>({...p,classGroup:e.target.value}))}/><select style={{...sel,width:'100%'}} value={newCov.day} onChange={e=>setNewCov(p=>({...p,day:Number(e.target.value)}))}>{DAYS.map((d,i)=><option key={i} value={i}>{d}</option>)}</select></div><textarea style={{...inp,resize:'vertical',minHeight:70,marginBottom:8}} placeholder="Work set / notes for cover teacher" value={newCov.work} onChange={e=>setNewCov(p=>({...p,work:e.target.value}))}/><button style={btnP} onClick={addCov}>Save</button></div>}
+        {wkCov.length===0?<div style={{color:C.mut,fontSize:12,textAlign:'center',padding:'20px 0'}}>No cover notes this week</div>:wkCov.map(c=><div key={c.id} style={{padding:'11px',borderRadius:8,marginBottom:7,background:C.sur2,border:`1px solid ${C.bor}`}}><div style={{display:'flex',justifyContent:'space-between',marginBottom:5}}><div style={{display:'flex',alignItems:'center',gap:9}}><span style={{fontWeight:700}}>{c.classGroup}</span><span style={{fontSize:11,color:C.acc,background:C.abg,padding:'2px 7px',borderRadius:20,fontWeight:600}}>{DAYS[c.day]}</span></div><button style={btnX} onClick={()=>delCov(c.id)}>✕</button></div><div style={{fontSize:12,lineHeight:1.6}}>{c.work}</div></div>)}
+      </div>
+    </div>;
+
+    if(id==='keydates'){
+      const todayS=new Date().toISOString().slice(0,10);
+      const fut=keyDates.filter(d=>d.date>=todayS),past=keyDates.filter(d=>d.date<todayS),ic2=keyDates.filter(d=>d.source==='imported').length;
+      return<div style={card}>
+        <SHead title="📌 Key Dates" id="keydates" actions={<><button style={btnG} onClick={()=>setShowCalImp(s=>!s)}>📄 Import</button><button style={btnP} onClick={()=>setShowAddDate(s=>!s)}>{showAddDate?'✕':'+ Add'}</button></>}/>
+        <div style={{padding:14}}>
+          {showCalImp&&<div style={{background:dark?'#0d2818':'#f0fdf4',border:'1px solid #22c55e44',borderRadius:12,padding:14,marginBottom:14}}>
+            <div style={{fontWeight:700,fontSize:13,color:'#22c55e',marginBottom:6}}>📄 Import calendar from Word</div>
+            <div style={{display:'flex',gap:9,flexWrap:'wrap',marginBottom:calMsg?9:0}}><button style={{...btnP,background:'#22c55e'}} onClick={()=>fc.current.click()} disabled={calBusy}>{calBusy?'⏳ Reading…':'📂 Choose .docx'}</button>{keyDates.some(d=>d.source==='imported')&&<button style={{...btnG,color:'#ef4444',borderColor:'#ef444444'}} onClick={()=>setKeyDates(p=>p.filter(d=>d.source!=='imported'))}>🗑 Clear</button>}<button style={btnG} onClick={()=>{setShowCalImp(false);setCalPrev(null);setCalMsg('')}}>Close</button></div>
+            {calMsg&&<div style={{fontSize:12,fontWeight:600,color:calMsg.startsWith('✅')||calMsg.startsWith('✓')?'#22c55e':calMsg.startsWith('❌')?'#ef4444':'#f59e0b',marginTop:8}}>{calMsg}</div>}
+            {calPrev&&calPrev.length>0&&<div style={{marginTop:12}}><div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8,flexWrap:'wrap',gap:7}}><span style={{fontSize:12,fontWeight:700}}>Review</span><div style={{display:'flex',gap:7}}><button style={btnG} onClick={()=>setCalPrev(p=>p.map(x=>({...x,keep:true})))}>All</button><button style={btnG} onClick={()=>setCalPrev(p=>p.map(x=>({...x,keep:false})))}>None</button><button style={{...btnP,background:'#22c55e'}} onClick={confirmCal}>✓ Import {calPrev.filter(x=>x.keep).length}</button></div></div><div style={{maxHeight:220,overflowY:'auto',border:`1px solid ${C.bor}`,borderRadius:8}}><table style={{width:'100%',borderCollapse:'collapse',fontSize:12}}><thead style={{position:'sticky',top:0,background:C.sur2}}><tr style={{borderBottom:`2px solid ${C.bor}`}}>{['','Date','Event','Cat'].map(h=><th key={h} style={{textAlign:'left',padding:'5px 8px',color:C.mut,fontWeight:600,fontSize:11}}>{h}</th>)}</tr></thead><tbody>{calPrev.map(x=><tr key={x.id} style={{borderBottom:`1px solid ${C.bor}`,opacity:x.keep?1:0.35}}><td style={{padding:'5px 8px'}}><button onClick={()=>togPrev(x.id)} style={{width:13,height:13,borderRadius:3,border:`2px solid ${x.keep?'#22c55e':C.bor}`,background:x.keep?'#22c55e':'transparent',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center'}}>{x.keep&&<span style={{color:'#fff',fontSize:8,fontWeight:800}}>✓</span>}</button></td><td style={{padding:'5px 8px',color:C.mut,whiteSpace:'nowrap'}}>{x.date?new Date(x.date+'T00:00:00').toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'2-digit'}):'—'}</td><td style={{padding:'5px 8px',fontWeight:500}}>{x.label}</td><td style={{padding:'5px 8px'}}><span style={{fontSize:10,fontWeight:700,padding:'1px 6px',borderRadius:20,background:C.abg,color:C.acc}}>{x.category}</span></td></tr>)}</tbody></table></div></div>}
+          </div>}
+          {showAddDate&&<div style={{background:C.abg,border:`1px solid ${C.acc}44`,borderRadius:10,padding:12,marginBottom:12}}><div style={{display:'grid',gridTemplateColumns:'1fr auto auto',gap:8,marginBottom:8}}><input style={inp} placeholder="Label" value={newDate.label} onChange={e=>setNewDate(p=>({...p,label:e.target.value}))}/><input style={{...inp,width:'auto'}} type="date" value={newDate.date} onChange={e=>setNewDate(p=>({...p,date:e.target.value}))}/><select style={sel} value={newDate.category} onChange={e=>setNewDate(p=>({...p,category:e.target.value}))}>{['general','exam','report','parents evening','INSET','assembly','trip','deadline'].map(c=><option key={c}>{c}</option>)}</select></div><button style={btnP} onClick={addDate}>Add</button></div>}
+          {keyDates.length===0?<div style={{color:C.mut,fontSize:12,textAlign:'center',padding:'20px 0'}}>No key dates yet</div>:<>
+            {ic2>0&&<div style={{fontSize:11,color:'#22c55e',background:dark?'#052e16':'#f0fdf4',border:'1px solid #22c55e33',borderRadius:8,padding:'5px 10px',marginBottom:9,display:'flex',justifyContent:'space-between',alignItems:'center'}}><span>📄 {ic2} imported</span><button style={{...btnX,color:'#ef4444',fontSize:11}} onClick={()=>setKeyDates(p=>p.filter(d=>d.source!=='imported'))}>Clear</button></div>}
+            {fut.map(d=><div key={d.id} style={{display:'flex',alignItems:'center',gap:10,padding:'8px 10px',borderRadius:8,marginBottom:5,background:C.sur2,border:`1px solid ${C.bor}`,borderLeft:`4px solid ${d.source==='imported'?'#22c55e':C.acc}`}}><div style={{flex:1,minWidth:0}}><span style={{fontWeight:600,fontSize:12}}>{d.label}</span><span style={{marginLeft:7,fontSize:10,color:C.acc,background:C.abg,padding:'1px 6px',borderRadius:20}}>{d.category}</span></div><span style={{fontSize:11,color:C.mut,whiteSpace:'nowrap'}}>{new Date(d.date+'T00:00:00').toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'})}</span><button style={btnX} onClick={()=>delDate(d.id)}>✕</button></div>)}
+            {past.length>0&&<><div style={{fontSize:10,fontWeight:700,color:C.mut,textTransform:'uppercase',letterSpacing:'0.07em',margin:'10px 0 5px'}}>Past</div>{past.map(d=><div key={d.id} style={{display:'flex',alignItems:'center',gap:10,padding:'6px 10px',borderRadius:8,marginBottom:4,opacity:0.4,background:C.sur2,border:`1px solid ${C.bor}`}}><div style={{flex:1,fontSize:11}}>{d.label}<span style={{color:C.mut}}> — {d.category}</span></div><span style={{fontSize:11,color:C.mut}}>{new Date(d.date+'T00:00:00').toLocaleDateString('en-GB',{day:'numeric',month:'short'})}</span><button style={btnX} onClick={()=>delDate(d.id)}>✕</button></div>)}</>}
+          </>}
+        </div>
+      </div>;
+    }
+
+    if(id==='reflect')return<div style={card}>
+      <SHead title="💬 End-of-Week Reflection" id="reflect" actions={null}/>
+      <div style={{padding:14}}>
+        <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:14}}><span style={{fontSize:12,color:C.mut}}>How was this week?</span>{[1,2,3,4,5].map(n=><button key={n} onClick={()=>updRefl('rating',n)} style={{background:'none',border:'none',cursor:'pointer',fontSize:20,opacity:wkRefl.rating>=n?1:0.2,padding:'1px 2px'}}>⭐</button>)}{wkRefl.rating>0&&<span style={{fontSize:12,color:C.mut}}>({wkRefl.rating}/5)</span>}</div>
+        <div style={{display:'grid',gridTemplateColumns:inRight?'1fr':'1fr 1fr',gap:12}}>
+          <div><span style={lbl}>✅ What went well?</span><textarea style={{...inp,resize:'vertical',minHeight:80,lineHeight:1.7}} placeholder="Lessons that landed…" value={wkRefl.wentWell} onChange={e=>updRefl('wentWell',e.target.value)}/></div>
+          <div><span style={lbl}>🔁 What needs following up?</span><textarea style={{...inp,resize:'vertical',minHeight:80,lineHeight:1.7}} placeholder="Students to check on…" value={wkRefl.followUp} onChange={e=>updRefl('followUp',e.target.value)}/></div>
+        </div>
+      </div>
+    </div>;
+
+    return null;
+  }
+}
+
+function App(){
+  const [dark]=useState(()=>load('tp_dark',false));
+  const [unlocked,setUnlocked]=useState(false);
+  const [showGist,setShowGist]=useState(false);
+  function handleUnlock(){const hasTok=!!load('mzr_gist_token','');const skip=load('mzr_gist_skipped',false);if(!hasTok&&!skip)setShowGist(true);else setUnlocked(true)}
+  if(!unlocked&&!showGist)return<PasswordScreen dark={dark} onUnlock={handleUnlock}/>;
+  if(showGist)return<GistSetup dark={dark} onDone={(t,id)=>{save('mzr_gist_token',t);save('mzr_gist_id',id);setShowGist(false);setUnlocked(true)}} onSkip={()=>{save('mzr_gist_skipped',true);setShowGist(false);setUnlocked(true)}}/>;
+  return<Planner/>;
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script></body></html>
